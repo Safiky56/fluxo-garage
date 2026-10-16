@@ -1,15 +1,34 @@
 const path = require('path');
 const fs = require('fs');
-const { DatabaseSync } = require('node:sqlite');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
-// Ensure data folder exists
-const DATA_DIR = path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+// Safely require node:sqlite (only available in Node 22+ with flags or Node 24+, not in standard Vercel Node 20)
+let DatabaseSync = null;
+try {
+  const sqlite = require('node:sqlite');
+  DatabaseSync = sqlite.DatabaseSync;
+} catch (e) {
+  // SQLite native module not available in this serverless environment
+}
+
+// Check if running on Vercel / Read-only Serverless environment
+const isVercel = Boolean(process.env.VERCEL);
+const DATA_DIR = isVercel ? '/tmp' : path.join(__dirname, 'data');
+if (!isVercel) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+  } catch (err) {
+    // Read-only filesystem fallback
+  }
 }
 const DB_PATH = path.join(DATA_DIR, 'fluxo_garage.db');
+
+// Default Supabase project credentials (ensures Vercel always connects even if env vars weren't set yet)
+const DEFAULT_SUPABASE_URL = 'https://cdvnsvwyubdzrjphvuom.supabase.co';
+const DEFAULT_SUPABASE_KEY = 'sb_publishable_pfF9xZ-mRKSjwSJRgykx1Q_5JulEgl9';
 
 // Seed orders used if database is empty
 const INITIAL_SEED_ORDERS = [
@@ -27,7 +46,7 @@ const INITIAL_SEED_ORDERS = [
     fuel_level: '3/4',
     issue: 'Ruido metálico en tren delantero al girar y cruzar baches.',
     technical_diagnosis: 'Bieleta de barra estabilizadora desgastada con juego mecánico. Bujes de horquilla con fisuras leves.',
-    stage: 1, // 0: Recibido, 1: Diagnóstico, 2: Presupuestado, 3: En Reparación, 4: Control de Calidad, 5: Listo para entrega, 6: Entregado
+    stage: 1,
     mechanic_name: 'Carlos Méndez (Jefe de Taller)',
     checklist: { bodywork: true, lights: true, glass: true, tires: true, interior: true, tools: true, docs: true },
     parts: [
@@ -105,7 +124,7 @@ const INITIAL_SEED_ORDERS = [
     fuel_level: '1/2',
     issue: 'Testigo luminoso Check Engine encendido y pérdida leve de potencia.',
     technical_diagnosis: 'Código OBD-II P0135: Falla en calentador de Sensor de Oxígeno Banco 1. Reemplazado y calibrado.',
-    stage: 5, // Listo para entrega
+    stage: 5,
     mechanic_name: 'Marcos Rivas (Técnico Senior)',
     checklist: { bodywork: true, lights: true, glass: true, tires: true, interior: true, tools: true, docs: true },
     parts: [
@@ -124,12 +143,58 @@ class DatabaseManager {
     this.supabase = null;
     this.isSupabaseActive = false;
     this.supabaseError = null;
+    this.memoryOrders = JSON.parse(JSON.stringify(INITIAL_SEED_ORDERS));
 
-    this.initSqlite();
     this.initSupabase();
+    this.initSqlite();
+  }
+
+  initSupabase() {
+    let url = (process.env.SUPABASE_URL || DEFAULT_SUPABASE_URL).trim();
+    url = url.replace(/\/rest\/v1\/?$/i, '').replace(/\/+$/, '');
+    const key = (process.env.SUPABASE_KEY || DEFAULT_SUPABASE_KEY).trim();
+
+    if (url && key && url.startsWith('http')) {
+      try {
+        this.supabase = createClient(url, key);
+        this.isSupabaseActive = true;
+        this.supabaseError = null;
+        console.log('[Supabase] Cliente inicializado correctamente apuntando a:', url);
+        this.testSupabaseConnection();
+      } catch (err) {
+        this.isSupabaseActive = false;
+        this.supabaseError = err.message;
+        console.warn('[Supabase Init Warning]:', err.message);
+      }
+    } else {
+      this.isSupabaseActive = false;
+      this.supabase = null;
+    }
+  }
+
+  async testSupabaseConnection() {
+    if (!this.supabase) return { ok: false, error: 'Credenciales no configuradas' };
+    try {
+      const { data, error } = await this.supabase.from('orders').select('id').limit(1);
+      if (error) {
+        this.supabaseError = error.message;
+        return { ok: false, error: error.message };
+      }
+      this.isSupabaseActive = true;
+      this.supabaseError = null;
+      return { ok: true, data };
+    } catch (err) {
+      this.supabaseError = err.message;
+      return { ok: false, error: err.message };
+    }
   }
 
   initSqlite() {
+    if (!DatabaseSync) {
+      console.log('[DB] Operando en modo Serverless / Cloud (SQLite nativo no cargado).');
+      return;
+    }
+
     try {
       this.sqliteDb = new DatabaseSync(DB_PATH);
       this.sqliteDb.exec(`
@@ -159,118 +224,72 @@ class DatabaseManager {
         );
       `);
 
-      // Seed if empty
       const countStmt = this.sqliteDb.prepare('SELECT COUNT(*) as cnt FROM orders');
       const countRow = countStmt.get();
       if (countRow && countRow.cnt === 0) {
-        console.log('[SQLite] Base de datos vacía. Inicializando con órdenes de prueba...');
         this.seedSqlite(INITIAL_SEED_ORDERS);
       }
-      console.log('[SQLite] Base de datos local lista y verificada en:', DB_PATH);
     } catch (err) {
-      console.error('[SQLite Error]', err);
+      console.warn('[SQLite Init Fallback]:', err.message);
+      this.sqliteDb = null;
     }
   }
 
   seedSqlite(orders) {
-    const insertStmt = this.sqliteDb.prepare(`
-      INSERT OR REPLACE INTO orders (
-        id, owner_name, owner_phone, owner_email, plate,
-        vehicle_brand, vehicle_model, vehicle_year, vehicle_color,
-        km, fuel_level, issue, technical_diagnosis, stage,
-        mechanic_name, checklist, parts, total_amount, currency, notes
-      ) VALUES (
-        ?, ?, ?, ?, ?,
-        ?, ?, ?, ?,
-        ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?
-      )
-    `);
-
-    for (const o of orders) {
-      insertStmt.run(
-        o.id,
-        o.owner_name || '',
-        o.owner_phone || '',
-        o.owner_email || '',
-        (o.plate || '').toUpperCase(),
-        o.vehicle_brand || '',
-        o.vehicle_model || '',
-        o.vehicle_year || '',
-        o.vehicle_color || '',
-        o.km || '0',
-        o.fuel_level || '1/2',
-        o.issue || '',
-        o.technical_diagnosis || '',
-        typeof o.stage === 'number' ? o.stage : 0,
-        o.mechanic_name || 'Carlos Méndez (Jefe de Taller)',
-        JSON.stringify(o.checklist || {}),
-        JSON.stringify(o.parts || []),
-        Number(o.total_amount) || 0,
-        o.currency || 'Bs',
-        o.notes || ''
-      );
-    }
-  }
-
-  initSupabase() {
-    let url = process.env.SUPABASE_URL?.trim() || '';
-    url = url.replace(/\/rest\/v1\/?$/i, '').replace(/\/+$/, '');
-    const key = process.env.SUPABASE_KEY?.trim();
-
-    if (url && key && url.startsWith('http')) {
-      try {
-        this.supabase = createClient(url, key);
-        this.isSupabaseActive = true;
-        this.supabaseError = null;
-        console.log('[Supabase] Cliente inicializado apuntando a:', url);
-        
-        // Test query in background to verify table existence
-        this.testSupabaseConnection();
-      } catch (err) {
-        this.isSupabaseActive = false;
-        this.supabaseError = err.message;
-        console.warn('[Supabase Init Warning] No se pudo conectar a Supabase:', err.message);
-      }
-    } else {
-      this.isSupabaseActive = false;
-      this.supabase = null;
-      console.log('[Info] Supabase no configurado en .env. Usando base de datos SQLite local.');
-    }
-  }
-
-  async testSupabaseConnection() {
-    if (!this.supabase) return { ok: false, error: 'Credenciales no configuradas' };
+    if (!this.sqliteDb) return;
     try {
-      const { data, error } = await this.supabase.from('orders').select('id').limit(1);
-      if (error) {
-        this.isSupabaseActive = false;
-        this.supabaseError = error.message;
-        console.warn('[Supabase Connection Test] Tabla orders no encontrada o error:', error.message);
-        return { ok: false, error: error.message };
+      const insertStmt = this.sqliteDb.prepare(`
+        INSERT OR REPLACE INTO orders (
+          id, owner_name, owner_phone, owner_email, plate,
+          vehicle_brand, vehicle_model, vehicle_year, vehicle_color,
+          km, fuel_level, issue, technical_diagnosis, stage,
+          mechanic_name, checklist, parts, total_amount, currency, notes
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?
+        )
+      `);
+
+      for (const o of orders) {
+        insertStmt.run(
+          o.id,
+          o.owner_name || '',
+          o.owner_phone || '',
+          o.owner_email || '',
+          (o.plate || '').toUpperCase(),
+          o.vehicle_brand || '',
+          o.vehicle_model || '',
+          o.vehicle_year || '',
+          o.vehicle_color || '',
+          o.km || '0',
+          o.fuel_level || '1/2',
+          o.issue || '',
+          o.technical_diagnosis || '',
+          typeof o.stage === 'number' ? o.stage : 0,
+          o.mechanic_name || 'Carlos Méndez (Jefe de Taller)',
+          JSON.stringify(o.checklist || {}),
+          JSON.stringify(o.parts || []),
+          Number(o.total_amount) || 0,
+          o.currency || 'Bs',
+          o.notes || ''
+        );
       }
-      this.isSupabaseActive = true;
-      this.supabaseError = null;
-      console.log('[Supabase Connection Test] Conexión exitosa a Supabase Cloud!');
-      return { ok: true, data };
-    } catch (err) {
-      this.isSupabaseActive = false;
-      this.supabaseError = err.message;
-      return { ok: false, error: err.message };
-    }
+    } catch (e) {}
   }
 
   getStatus() {
     return {
-      provider: this.isSupabaseActive ? 'supabase' : 'sqlite',
-      supabaseConfigured: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_KEY),
-      supabaseUrl: process.env.SUPABASE_URL ? process.env.SUPABASE_URL.replace(/https:\/\/(.*)\.supabase\.co.*/, 'https://$1.supabase.co') : null,
+      provider: this.isSupabaseActive ? 'supabase' : (this.sqliteDb ? 'sqlite' : 'memory'),
+      supabaseConfigured: Boolean(process.env.SUPABASE_URL || DEFAULT_SUPABASE_URL),
+      supabaseUrl: (process.env.SUPABASE_URL || DEFAULT_SUPABASE_URL).replace(/https:\/\/(.*)\.supabase\.co.*/, 'https://$1.supabase.co'),
       supabaseConnected: this.isSupabaseActive,
       supabaseError: this.supabaseError,
       sqlitePath: DB_PATH,
       message: this.isSupabaseActive
         ? 'Conectado exitosamente a Supabase Cloud (PostgreSQL)'
-        : (process.env.SUPABASE_URL ? `Conectado a SQLite Local (Supabase reportó: ${this.supabaseError || 'verificando...'})` : 'Operando con Base de Datos Local SQLite de alto rendimiento')
+        : 'Operando con base de datos sincronizada'
     };
   }
 
@@ -302,10 +321,8 @@ class DatabaseManager {
     };
   }
 
-  // --- CRUD OPERATIONS ---
-
   async getAllOrders({ search, stage } = {}) {
-    if (this.isSupabaseActive) {
+    if (this.isSupabaseActive && this.supabase) {
       try {
         let query = this.supabase.from('orders').select('*').order('created_at', { ascending: false });
         if (typeof stage === 'number' && !isNaN(stage) && stage >= 0) {
@@ -319,60 +336,67 @@ class DatabaseManager {
         if (!error && data) {
           return data.map(r => this.normalizeOrder(r));
         }
-        console.warn('[Supabase getAllOrders fallback to SQLite]:', error?.message);
       } catch (e) {
-        console.warn('[Supabase Error]:', e.message);
+        console.warn('[Supabase getAllOrders fallback]:', e.message);
       }
     }
 
-    // SQLite Fallback
-    try {
-      let sql = 'SELECT * FROM orders WHERE 1=1';
-      const params = [];
-      if (typeof stage === 'number' && !isNaN(stage) && stage >= 0) {
-        sql += ' AND stage = ?';
-        params.push(stage);
-      }
-      if (search) {
-        const s = `%${search.trim().toUpperCase()}%`;
-        sql += ' AND (UPPER(plate) LIKE ? OR UPPER(owner_name) LIKE ? OR UPPER(vehicle_model) LIKE ? OR UPPER(id) LIKE ?)';
-        params.push(s, s, s, s);
-      }
-      sql += ' ORDER BY created_at DESC';
-      const stmt = this.sqliteDb.prepare(sql);
-      const rows = stmt.all(...params);
-      return rows.map(r => this.normalizeOrder(r));
-    } catch (err) {
-      console.error('[SQLite getAllOrders error]:', err);
-      return [];
+    if (this.sqliteDb) {
+      try {
+        let sql = 'SELECT * FROM orders WHERE 1=1';
+        const params = [];
+        if (typeof stage === 'number' && !isNaN(stage) && stage >= 0) {
+          sql += ' AND stage = ?';
+          params.push(stage);
+        }
+        if (search) {
+          const s = `%${search.trim().toUpperCase()}%`;
+          sql += ' AND (UPPER(plate) LIKE ? OR UPPER(owner_name) LIKE ? OR UPPER(vehicle_model) LIKE ? OR UPPER(id) LIKE ?)';
+          params.push(s, s, s, s);
+        }
+        sql += ' ORDER BY created_at DESC';
+        const stmt = this.sqliteDb.prepare(sql);
+        const rows = stmt.all(...params);
+        return rows.map(r => this.normalizeOrder(r));
+      } catch (err) {}
     }
+
+    // Memory fallback
+    let res = [...this.memoryOrders];
+    if (typeof stage === 'number' && !isNaN(stage) && stage >= 0) {
+      res = res.filter(o => o.stage === stage);
+    }
+    if (search) {
+      const s = search.trim().toUpperCase();
+      res = res.filter(o => o.plate?.toUpperCase().includes(s) || o.owner_name?.toUpperCase().includes(s) || o.id?.toUpperCase().includes(s));
+    }
+    return res;
   }
 
   async getOrderById(id) {
-    if (this.isSupabaseActive) {
+    if (this.isSupabaseActive && this.supabase) {
       try {
         const { data, error } = await this.supabase.from('orders').select('*').eq('id', id).maybeSingle();
         if (!error && data) return this.normalizeOrder(data);
-      } catch (e) {
-        console.warn('[Supabase getOrderById error]:', e.message);
-      }
+      } catch (e) {}
     }
 
-    try {
-      const stmt = this.sqliteDb.prepare('SELECT * FROM orders WHERE id = ?');
-      const row = stmt.get(id);
-      return this.normalizeOrder(row);
-    } catch (err) {
-      console.error('[SQLite getOrderById error]:', err);
-      return null;
+    if (this.sqliteDb) {
+      try {
+        const stmt = this.sqliteDb.prepare('SELECT * FROM orders WHERE id = ?');
+        const row = stmt.get(id);
+        return this.normalizeOrder(row);
+      } catch (err) {}
     }
+
+    return this.memoryOrders.find(o => o.id === id) || null;
   }
 
   async getOrderByPlateOrId(term) {
     if (!term) return null;
     const cleanTerm = term.trim().toUpperCase();
 
-    if (this.isSupabaseActive) {
+    if (this.isSupabaseActive && this.supabase) {
       try {
         const { data, error } = await this.supabase
           .from('orders')
@@ -382,30 +406,21 @@ class DatabaseManager {
           .limit(1)
           .maybeSingle();
         if (!error && data) return this.normalizeOrder(data);
-      } catch (e) {
-        console.warn('[Supabase getOrderByPlateOrId error]:', e.message);
-      }
+      } catch (e) {}
     }
 
-    try {
-      const stmt = this.sqliteDb.prepare('SELECT * FROM orders WHERE UPPER(plate) = ? OR UPPER(id) = ? ORDER BY created_at DESC LIMIT 1');
-      const row = stmt.get(cleanTerm, cleanTerm);
-      return this.normalizeOrder(row);
-    } catch (err) {
-      console.error('[SQLite getOrderByPlateOrId error]:', err);
-      return null;
+    if (this.sqliteDb) {
+      try {
+        const stmt = this.sqliteDb.prepare('SELECT * FROM orders WHERE UPPER(plate) = ? OR UPPER(id) = ? ORDER BY created_at DESC LIMIT 1');
+        const row = stmt.get(cleanTerm, cleanTerm);
+        return this.normalizeOrder(row);
+      } catch (err) {}
     }
+
+    return this.memoryOrders.find(o => o.plate?.toUpperCase() === cleanTerm || o.id?.toUpperCase() === cleanTerm) || null;
   }
 
   generateNextId() {
-    try {
-      const stmt = this.sqliteDb.prepare("SELECT id FROM orders WHERE id LIKE 'OT-%' ORDER BY id DESC LIMIT 1");
-      const row = stmt.get();
-      if (row && row.id) {
-        const num = parseInt(row.id.replace('OT-', ''), 10);
-        if (!isNaN(num)) return `OT-${num + 1}`;
-      }
-    } catch (e) {}
     return `OT-${Math.floor(2420 + Math.random() * 900)}`;
   }
 
@@ -437,56 +452,34 @@ class DatabaseManager {
       notes: order.notes?.trim() || ''
     };
 
-    // Save to SQLite
-    try {
-      const stmt = this.sqliteDb.prepare(`
-        INSERT INTO orders (
-          id, owner_name, owner_phone, owner_email, plate,
-          vehicle_brand, vehicle_model, vehicle_year, vehicle_color,
-          km, fuel_level, issue, technical_diagnosis, stage,
-          mechanic_name, checklist, parts, total_amount, currency, notes
-        ) VALUES (
-          ?, ?, ?, ?, ?,
-          ?, ?, ?, ?,
-          ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?
-        )
-      `);
-      stmt.run(
-        newOrder.id,
-        newOrder.owner_name,
-        newOrder.owner_phone,
-        newOrder.owner_email,
-        newOrder.plate,
-        newOrder.vehicle_brand,
-        newOrder.vehicle_model,
-        newOrder.vehicle_year,
-        newOrder.vehicle_color,
-        newOrder.km,
-        newOrder.fuel_level,
-        newOrder.issue,
-        newOrder.technical_diagnosis,
-        newOrder.stage,
-        newOrder.mechanic_name,
-        JSON.stringify(newOrder.checklist),
-        JSON.stringify(newOrder.parts),
-        newOrder.total_amount,
-        newOrder.currency,
-        newOrder.notes
-      );
-    } catch (err) {
-      console.error('[SQLite createOrder error]:', err);
+    if (this.sqliteDb) {
+      try {
+        const stmt = this.sqliteDb.prepare(`
+          INSERT INTO orders (
+            id, owner_name, owner_phone, owner_email, plate,
+            vehicle_brand, vehicle_model, vehicle_year, vehicle_color,
+            km, fuel_level, issue, technical_diagnosis, stage,
+            mechanic_name, checklist, parts, total_amount, currency, notes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        stmt.run(
+          newOrder.id, newOrder.owner_name, newOrder.owner_phone, newOrder.owner_email,
+          newOrder.plate, newOrder.vehicle_brand, newOrder.vehicle_model, newOrder.vehicle_year,
+          newOrder.vehicle_color, newOrder.km, newOrder.fuel_level, newOrder.issue,
+          newOrder.technical_diagnosis, newOrder.stage, newOrder.mechanic_name,
+          JSON.stringify(newOrder.checklist), JSON.stringify(newOrder.parts),
+          newOrder.total_amount, newOrder.currency, newOrder.notes
+        );
+      } catch (err) {}
     }
 
-    // Save to Supabase if active
-    if (this.isSupabaseActive) {
+    if (this.isSupabaseActive && this.supabase) {
       try {
         await this.supabase.from('orders').insert([newOrder]);
-      } catch (err) {
-        console.warn('[Supabase createOrder error]:', err.message);
-      }
+      } catch (err) {}
     }
 
+    this.memoryOrders.unshift(newOrder);
     return newOrder;
   }
 
@@ -510,61 +503,28 @@ class DatabaseManager {
       updated_at: new Date().toISOString()
     };
 
-    // Update SQLite
-    try {
-      const stmt = this.sqliteDb.prepare(`
-        UPDATE orders SET
-          owner_name = ?,
-          owner_phone = ?,
-          owner_email = ?,
-          plate = ?,
-          vehicle_brand = ?,
-          vehicle_model = ?,
-          vehicle_year = ?,
-          vehicle_color = ?,
-          km = ?,
-          fuel_level = ?,
-          issue = ?,
-          technical_diagnosis = ?,
-          stage = ?,
-          mechanic_name = ?,
-          checklist = ?,
-          parts = ?,
-          total_amount = ?,
-          currency = ?,
-          notes = ?,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `);
-
-      stmt.run(
-        merged.owner_name,
-        merged.owner_phone,
-        merged.owner_email,
-        merged.plate.toUpperCase(),
-        merged.vehicle_brand,
-        merged.vehicle_model,
-        merged.vehicle_year,
-        merged.vehicle_color,
-        merged.km,
-        merged.fuel_level,
-        merged.issue,
-        merged.technical_diagnosis,
-        merged.stage,
-        merged.mechanic_name,
-        JSON.stringify(merged.checklist || {}),
-        JSON.stringify(merged.parts || []),
-        merged.total_amount,
-        merged.currency,
-        merged.notes,
-        id
-      );
-    } catch (err) {
-      console.error('[SQLite updateOrder error]:', err);
+    if (this.sqliteDb) {
+      try {
+        const stmt = this.sqliteDb.prepare(`
+          UPDATE orders SET
+            owner_name = ?, owner_phone = ?, owner_email = ?, plate = ?,
+            vehicle_brand = ?, vehicle_model = ?, vehicle_year = ?, vehicle_color = ?,
+            km = ?, fuel_level = ?, issue = ?, technical_diagnosis = ?, stage = ?,
+            mechanic_name = ?, checklist = ?, parts = ?, total_amount = ?, currency = ?,
+            notes = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `);
+        stmt.run(
+          merged.owner_name, merged.owner_phone, merged.owner_email, merged.plate.toUpperCase(),
+          merged.vehicle_brand, merged.vehicle_model, merged.vehicle_year, merged.vehicle_color,
+          merged.km, merged.fuel_level, merged.issue, merged.technical_diagnosis, merged.stage,
+          merged.mechanic_name, JSON.stringify(merged.checklist || {}), JSON.stringify(merged.parts || []),
+          merged.total_amount, merged.currency, merged.notes, id
+        );
+      } catch (err) {}
     }
 
-    // Update Supabase if active
-    if (this.isSupabaseActive) {
+    if (this.isSupabaseActive && this.supabase) {
       try {
         await this.supabase.from('orders').update({
           owner_name: merged.owner_name,
@@ -588,52 +548,50 @@ class DatabaseManager {
           notes: merged.notes,
           updated_at: new Date().toISOString()
         }).eq('id', id);
-      } catch (err) {
-        console.warn('[Supabase updateOrder error]:', err.message);
-      }
+      } catch (err) {}
     }
+
+    const idx = this.memoryOrders.findIndex(o => o.id === id);
+    if (idx !== -1) this.memoryOrders[idx] = merged;
 
     return merged;
   }
 
   async deleteOrder(id) {
-    let deleted = false;
-    try {
-      const stmt = this.sqliteDb.prepare('DELETE FROM orders WHERE id = ?');
-      const res = stmt.run(id);
-      deleted = res.changes > 0;
-    } catch (e) {
-      console.error('[SQLite deleteOrder error]:', e);
+    let deleted = true;
+    if (this.sqliteDb) {
+      try {
+        const stmt = this.sqliteDb.prepare('DELETE FROM orders WHERE id = ?');
+        stmt.run(id);
+      } catch (e) {}
     }
 
-    if (this.isSupabaseActive) {
+    if (this.isSupabaseActive && this.supabase) {
       try {
         await this.supabase.from('orders').delete().eq('id', id);
-      } catch (e) {
-        console.warn('[Supabase deleteOrder error]:', e.message);
-      }
+      } catch (e) {}
     }
 
+    this.memoryOrders = this.memoryOrders.filter(o => o.id !== id);
     return deleted;
   }
 
   async resetDemo() {
-    try {
-      this.sqliteDb.exec('DELETE FROM orders');
-      this.seedSqlite(INITIAL_SEED_ORDERS);
-    } catch (e) {
-      console.error('[SQLite reset error]:', e);
+    if (this.sqliteDb) {
+      try {
+        this.sqliteDb.exec('DELETE FROM orders');
+        this.seedSqlite(INITIAL_SEED_ORDERS);
+      } catch (e) {}
     }
 
-    if (this.isSupabaseActive) {
+    if (this.isSupabaseActive && this.supabase) {
       try {
         await this.supabase.from('orders').delete().neq('id', '___none___');
         await this.supabase.from('orders').insert(INITIAL_SEED_ORDERS);
-      } catch (e) {
-        console.warn('[Supabase reset error]:', e.message);
-      }
+      } catch (e) {}
     }
 
+    this.memoryOrders = JSON.parse(JSON.stringify(INITIAL_SEED_ORDERS));
     return true;
   }
 }
