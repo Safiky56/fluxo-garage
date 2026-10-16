@@ -15,6 +15,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Serve frontend assets
 app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
 
 // --- API ENDPOINTS ---
 
@@ -224,6 +225,10 @@ app.get('/api/export/csv', async (req, res) => {
 
 // Fallback to index.html
 app.use((req, res) => {
+  const rootIndex = path.join(__dirname, 'index.html');
+  if (fs.existsSync(rootIndex)) {
+    return res.sendFile(rootIndex);
+  }
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
